@@ -12,13 +12,6 @@ class Consultant:
             azure_endpoint=("")
         )
         self.deployment = "Ministral-3B"
-
-#    def __init__(self):
-#        self.client = OpenAI(
-#            base_url="https://openrouter.ai/api/v1",
-#            api_key="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"  # Replace with your actual OpenRouter API key
-#        )
-#        self.deployment = "deepseek/deepseek-prover-v2:free"
     
     def consult(self, query: str) -> str:
         """Get advice from the consultant LLM"""
