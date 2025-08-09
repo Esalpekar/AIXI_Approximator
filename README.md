@@ -1,26 +1,67 @@
-# LLM AIXI
+# LLM-AIXI
 
-A practical implementation of AIXI using Large Language Models. This project was meant to explore the creation of agentic structures from scratch. To stay fundamental, itexplores how many deviations from Hutter's ideal universal agent are necessary to create a functional system.
+AIXI (Hutter 2005) is a formalization of a universal, ideal, and uncomputable agent that maximizes a reward metric in an unknown environment. This project explores how many practical deviations from this ideal must be taken to achieve a functional agent.
 
-## Overview
+See [Instructions/Background.txt](Instructions/Background.txt) for complete theoretical background.
 
-AIXI (Hutter 2005) formalizes a universal, ideal, and uncomputable agent that maximizes reward in unknown environments. This implementation adapts AIXI to work with LLMs through several key modifications:
+## Theory
 
-- **Constitution-based guidance**: A text-based moral and productive framework guides agent behavior
-- **Judge-based evaluation**: Each action is evaluated against the constitution, providing detailed feedback as the reward signal
-- **Sub-environments as tools**: Tools are recast as self-manifested models of the environment that can be sampled for observations
-- **Text-only data flow**: All information remains in high-fidelity text format, leveraging attention mechanisms for compression rather than quantitative metrics
+This is a purely qualitative instantiation of a Bayesian AIXI reasoner. The operational philosophy is that quantitative data is just compressed qualitative data. Data in the form of an essay contains all the necessary information; it is just not compressed.
 
-## Architecture
+### Core Components
 
-The system consists of:
+- **Constitution**: Serves as the agent's moral and productive guide
+- **Judge**: Evaluates each action against the constitution and returns a detailed report (reward percept)
+- **Subenvironments**: Tools recast as self-manifested models of the true environment
+- **Ideator**: Proposes actions based on full history, constitution, and tool templates
+- **History**: Complete, uncompressed record of all action-perception cycles
 
-- **Agent**: LLM-powered decision maker that selects actions based on constitution and history
-- **Judge**: Evaluates actions against the constitution and provides detailed reward essays
-- **Orchestrator**: Routes actions to appropriate sub-environments and coordinates evaluation
-- **Sub-environments**: Tools including code execution, web search, file system, and human consultation
+### Operating Loop
 
+1. Agent selects a subenvironment and generates input text
+2. Environment returns tool result and judge's constitutional evaluation
+3. Both are added to agent's complete history for next cycle
+4. Process repeats for fixed number of cycles (finite lifespan)
 
-## Reference
+### Deviations from True AIXI
 
-Based on Marcus Hutter's AIXI framework: https://arxiv.org/abs/cs/0004001
+- LLM reasoning replaces uncomputable Solomonoff induction
+- Environment split into true environment (judge) and modeled subenvironments
+- Starts with prior knowledge (LLM training, constitution)
+- Finite cycles rather than infinite horizon
+- Qualitative rather than quantitative optimization
+
+## Features
+
+- Constitutional governance with ethical safeguards
+- Judge-based evaluation and learning
+- Four subenvironments: file system, web search, code execution, LLM consultation
+- Complete history maintenance without compression
+- Token usage tracking and cost estimation
+- Secure, restricted tool access
+- Detailed execution logging
+
+## Setup
+
+1. Install dependencies: `pip install -r requirements.txt`
+2. Configure Google Cloud Vertex AI credentials
+3. Copy `Config/.env.example` to `Config/.env` and set your project ID
+4. Set objective in `data/constitution.txt`
+5. Run: `python main.py`
+
+## Project Structure
+
+```
+agent/              # Core reasoning (Ideator, data models)
+environment/        # Judge and orchestrator
+subenvironments/    # Tool implementations
+utils/              # Token tracking
+Config/             # API configuration
+data/               # Constitution
+Histories/          # Execution logs
+Working Directory/  # Agent workspace
+```
+
+## Educational Purpose
+
+This project is a lesson in agent design, intended for educational purposes where optimization and scalability are not primary concerns. It demonstrates practical approximation of theoretical optimal agents using modern language models.

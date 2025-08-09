@@ -1,118 +1,226 @@
-# project_root/agent/agent.py
+"""
+Ideator Agent for LLM-AIXI project.
+Implements the main decision-making component that chooses actions based on history and constitution.
+"""
+
 import json
-import os
-from openai import AzureOpenAI, OpenAI
-from typing import Dict, Callable, List
-from .models import Agent, Action, Percept
+import re
+from typing import Optional, Tuple
+import vertexai
+from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
 
-class BayesianAgent(Agent):
+from .models import Action, AgentState
+from utils.token_tracker import TokenTracker
+
+
+class Ideator:
     """
-    An agent that uses a Large Language Model to decide its next action,
-    based on its constitution, goals, and a high-fidelity text history.
+    The Ideator is the core decision-making component of the LLM-AIXI agent.
+    
+    It receives the full history, constitution, and tool documentation, then
+    uses an LLM to choose the next action. This replaces the uncomputable
+    Solomonoff induction in the original AIXI with practical LLM reasoning.
     """
+    
+    def __init__(self, project_id: str, location: str = "us-central1", 
+                 model_name: str = "gemini-1.5-pro", token_tracker: Optional[TokenTracker] = None):
+        """
+        Initialize the Ideator.
+        
+        Args:
+            project_id: Google Cloud project ID
+            location: Vertex AI location
+            model_name: Model to use for decision-making
+            token_tracker: Optional token usage tracker
+        """
+        self.project_id = project_id
+        self.location = location
+        self.model_name = model_name
+        self.token_tracker = token_tracker
 
-    def __init__(self, constitution: str, tools: Dict[str, Callable]):
-        super().__init__(constitution, tools)
-        self.client = AzureOpenAI(
-            api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-            api_version="2024-06-01",
-            azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT",)
-       )
-        self.deployment = "Ministral-3B"
+        # Initialize Vertex AI
+        vertexai.init(project=project_id, location=location)
 
-    def _format_history(self) -> str:
-        """Formats the last few history entries for the prompt."""
-        if not self.history:
-            return "No history yet. This is the first action."
+        # Initialize the model with settings optimized for reasoning
+        self.model = GenerativeModel(
+            model_name=model_name,
+            generation_config={
+                "temperature": 0.7,  # Balanced creativity and consistency
+                "top_p": 0.9,
+                "top_k": 40,
+                "max_output_tokens": 4096,
+            },
+            safety_settings={
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            }
+        )
+    
+    def _construct_prompt(self, agent_state: AgentState, constitution: str, tool_docs: str) -> str:
+        """
+        Construct the comprehensive prompt for action selection.
+        
+        Args:
+            agent_state: Current state of the agent
+            constitution: The agent's constitution
+            tool_docs: Documentation for available tools
             
-        formatted_entries = []
-        # --- THIS IS THE CORRECTED SECTION ---
-        # We now iterate through a list of dictionaries, not tuples.
-        for turn in self.history[-10:]:
-            # Use .get() for safe access, just in case the dict is malformed
-            action = turn.get('action')
-            percept = turn.get('percept')
-
-            # Add a safety check in case a turn is malformed
-            if not action or not percept:
-                continue
-
-            # This logic remains the same, it just uses the extracted variables
-            entry = (
-                f"  - Action: {action.tool} with payload: {json.dumps(action.payload)}\n"
-                f"  - Observation: {str(percept.observation)}...\n" # Truncate long observations
-                f"  - Judge's Feedback: {percept.reward}...\n" # Truncate long feedback
-                f"  - Action's Cost Profile: {percept.cost_analysis}"
-            )
-            formatted_entries.append(entry)
-        return "\n".join(formatted_entries)
-
-    def decide_next_action(self) -> Action:
+        Returns:
+            Complete prompt string
         """
-        Uses the LLM to decide the next action based on the current state.
+        prompt_parts = [
+            "You are an autonomous AI agent operating under the LLM-AIXI framework.",
+            "You must choose your next action based on your constitution, history, and available tools.",
+            "",
+            "=== YOUR CONSTITUTION ===",
+            constitution,
+            "",
+            "=== AVAILABLE SUBENVIRONMENTS (TOOLS) ===",
+            tool_docs,
+            "",
+            "=== YOUR HISTORY ===",
+            agent_state.get_formatted_history(),
+            ""
+        ]
+        
+        # Add judge's feedback if available
+        last_feedback = agent_state.get_last_judge_feedback()
+        if last_feedback:
+            prompt_parts.extend([
+                "=== JUDGE'S FEEDBACK ON YOUR LAST ACTION ===",
+                f"Your last action was evaluated thusly: {last_feedback}",
+                "Use this feedback to improve your next action.",
+                ""
+            ])
+        
+        prompt_parts.extend([
+            "=== INSTRUCTIONS ===",
+            "Based on your constitution, history, and any judge feedback, choose your next action.",
+            "",
+            "You must respond with EXACTLY this format:",
+            "",
+            "REASONING:",
+            "[Explain your reasoning for this action, connecting it to your constitution and goals]",
+            "",
+            "ACTION:",
+            "subenvironment: [name of subenvironment]",
+            "input_body: [JSON input for the subenvironment]",
+            "",
+            "IMPORTANT:",
+            "- Follow your constitution strictly",
+            "- Learn from judge feedback",
+            "- Choose actions that advance your primary objective",
+            "- Ensure input_body is valid JSON for the chosen subenvironment",
+            "- Be strategic and avoid redundant actions",
+            "",
+            "Choose your action now:"
+        ])
+        
+        return "\n".join(prompt_parts)
+    
+    def _parse_response(self, response_text: str) -> Tuple[Optional[Action], str]:
         """
-
-        system_prompt = """
-You are the reasoning core of an AI agent. Your goal is to achieve the objective defined in your constitution by strategically using a set of available tools. Your response MUST be a single, valid JSON object and nothing else.
-"""
-        user_prompt = f"""
-**CONSTITUTION & GOAL:**
-{self.constitution}
-
----
-
-**FILE SYSTEM CONTEXT:**
-All `file_system` operations are sandboxed inside a specific working directory. The tool's output will ALWAYS include a `working_directory` key containing the absolute path of this sandbox. You MUST use this path to understand where your files are and to construct correct relative paths for future commands.
-
----
-
-**AVAILABLE TOOLS & THEIR PAYLOAD STRUCTURES:**
-- **file_system**:
-    - To write a file: `{{"operation": "write", "path": "your/file/path.html", "content": "..."}}`
-    - To read a file: `{{"operation": "read", "path": "your/file/path.html"}}`
-    - To check existence: `{{"operation": "exists", "path": "your/file/path.html"}}`
-    - To list files: `{{"operation": "list", "path": "your/directory/"}}`
-- **code_executor**: Payload is a string of any code.
-- **web_search**: Payload is a string with a search query.
-- **consultant**: Payload is a string with your question.
-- **query_human**: Payload is a string with a question for the user.
-
----
-
-**RECENT HISTORY (Uncompressed, High-Fidelity):**
-{self._format_history()}
-
----
-
-**TASK:**
-Based on the constitution, your goal, the tools' payload structures, and your recent history, determine the best next action. Return your decision as a JSON object: {{"thought": "A brief thought process on why you chose this action.", "action": {{"tool": "tool_name", "payload": {{...}} or "string"}}}}
-"""
-
+        Parse the LLM response to extract the action.
+        
+        Args:
+            response_text: Raw response from the LLM
+            
+        Returns:
+            Tuple of (Action object or None, error message)
+        """
         try:
-            response = self.client.chat.completions.create(
-                model=self.deployment,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                max_tokens=10000,
-                temperature=0.4,
-                response_format={"type": "json_object"}
+            # Extract reasoning
+            reasoning_match = re.search(r'REASONING:\s*(.*?)(?=ACTION:|$)', response_text, re.DOTALL)
+            reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
+            
+            # Extract action section
+            action_match = re.search(r'ACTION:\s*(.*?)$', response_text, re.DOTALL)
+            if not action_match:
+                return None, "No ACTION section found in response"
+            
+            action_text = action_match.group(1).strip()
+            
+            # Parse subenvironment and input_body
+            subenvironment_match = re.search(r'subenvironment:\s*(.+)', action_text)
+            input_body_match = re.search(r'input_body:\s*(.*)', action_text, re.DOTALL)
+            
+            if not subenvironment_match:
+                return None, "No subenvironment specified in action"
+            
+            if not input_body_match:
+                return None, "No input_body specified in action"
+            
+            subenvironment = subenvironment_match.group(1).strip()
+            input_body = input_body_match.group(1).strip()
+            
+            # Validate JSON input_body
+            try:
+                json.loads(input_body)
+            except json.JSONDecodeError as e:
+                return None, f"Invalid JSON in input_body: {str(e)}"
+            
+            # Create action
+            action = Action(
+                subenvironment=subenvironment,
+                input_body=input_body,
+                reasoning=reasoning
             )
-
-            decision_json = json.loads(response.choices[0].message.content)
-            action_data = decision_json.get("action", {})
-            tool = action_data.get("tool")
-            payload = action_data.get("payload")
-
-            if tool not in self.tools:
-                print(f"WARNING: LLM chose an invalid tool '{tool}'. Defaulting to consultant.")
-                return Action("consultant", f"The last chosen tool ('{tool}') was invalid. What is a better next step considering the history?")
-
-            return Action(tool=tool, payload=payload)
-
+            
+            return action, ""
+            
         except Exception as e:
-            print(f"CRITICAL ERROR: Error during LLM decision making: {e}. Defaulting to a safe action.")
-            # import traceback
-            # traceback.print_exc()
-            return Action("consultant", "I encountered a critical error in my decision-making process and could not parse the response. What should I do next?")
+            return None, f"Error parsing response: {str(e)}"
+    
+    def choose_action(self, agent_state: AgentState, constitution: str, tool_docs: str) -> Tuple[Optional[Action], str]:
+        """
+        Choose the next action for the agent.
+        
+        Args:
+            agent_state: Current state of the agent
+            constitution: The agent's constitution
+            tool_docs: Documentation for available tools
+            
+        Returns:
+            Tuple of (Action object or None, error message)
+        """
+        try:
+            # Construct the prompt
+            prompt = self._construct_prompt(agent_state, constitution, tool_docs)
+            
+            # Make the API call
+            response = self.model.generate_content(prompt)
+            
+            if not response.text:
+                return None, "No response received from LLM"
+            
+            # Track token usage if tracker is available
+            if self.token_tracker:
+                self.token_tracker.track_usage(prompt, response.text, "ideator")
+            
+            # Parse the response
+            action, error = self._parse_response(response.text)
+            
+            if error:
+                return None, f"Failed to parse LLM response: {error}"
+            
+            return action, ""
+            
+        except Exception as e:
+            return None, f"Error in action selection: {str(e)}"
+    
+    def get_model_info(self) -> dict:
+        """
+        Get information about the model configuration.
+        
+        Returns:
+            Dictionary with model information
+        """
+        return {
+            "project_id": self.project_id,
+            "location": self.location,
+            "model_name": self.model_name,
+            "temperature": self.model.generation_config.temperature,
+            "max_output_tokens": self.model.generation_config.max_output_tokens
+        }

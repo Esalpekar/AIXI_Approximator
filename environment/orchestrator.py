@@ -1,67 +1,189 @@
-# project_root/environment/orchestrator.py
-from typing import Dict, Callable, List, Any
-from agent.models import Action, Percept
-from .judge import Judge
+"""
+Orchestrator for LLM-AIXI project.
+Routes actions to subenvironments and coordinates judge evaluation.
+"""
+
+from typing import Optional, Dict, Any, Callable
+from agent.models import Action, Percept, AgentState
+from environment.judge import Judge
+from subenvironments import SUBENVIRONMENTS
+
 
 class Orchestrator:
-    """Routes actions to subenvironments and coordinates with the judge"""
+    """
+    The Orchestrator manages the interaction between the agent and its environment.
     
-    def __init__(self, subenvironments: Dict[str, Callable], constitution: str):
+    It routes actions to the appropriate subenvironments, collects results,
+    and coordinates with the judge to provide complete percepts back to the agent.
+    """
+    
+    def __init__(self, judge: Judge):
         """
-        Initializes the Orchestrator.
+        Initialize the Orchestrator.
         
         Args:
-            subenvironments (Dict[str, Callable]): A dictionary mapping tool names to their callable functions.
-            constitution (str): The agent's guiding principles.
+            judge: Judge instance for evaluating actions
         """
-        self.subenvironments = subenvironments
-        self.judge = Judge()
-        self.constitution = constitution
+        self.judge = judge
+        self.subenvironments = SUBENVIRONMENTS
     
-    def _analyze_action_profile(self, action: Action) -> str:
-        """Generates a qualitative analysis of an action's cost-benefit profile."""
-        cost_benefit_profiles = {
-            "consultant": "This action is resource-intensive, consuming significant tokens and time. It should be reserved for complex, high-level strategic questions.",
-            "web_search": "This action involves network latency. It is most effective when used with precise, targeted queries to find specific facts or documentation.",
-            "code_executor": "This action is computationally moderate. Its primary risk is executing flawed code, which can waste a turn. Best used for small, verifiable snippets.",
-            "file_system": "This is a low-cost, low-risk action. It is highly efficient for understanding the project state and for persisting completed work.",
-            "query_human": "This is the highest-cost action, as it interrupts the user's workflow. It is only permissible when information is genuinely missing and unrecoverable."
-        }
-        return cost_benefit_profiles.get(action.tool, "This action has an undefined cost-benefit profile.")
-
-    # FIX 1 of 2: The 'history' list is now accepted as a parameter.
-    def process_action(self, action: Action, history: List[Dict[str, Any]]) -> Percept:
+    def get_available_subenvironments(self) -> Dict[str, str]:
         """
-        Process an action through the appropriate subenvironment and judge, including historical context.
+        Get a list of available subenvironments and their descriptions.
+        
+        Returns:
+            Dictionary mapping subenvironment names to descriptions
+        """
+        return {name: info["description"] for name, info in self.subenvironments.items()}
+    
+    def process_action(self, action: Action, agent_state: AgentState, constitution: str) -> Percept:
+        """
+        Process an action by routing it to the appropriate subenvironment and getting judge evaluation.
         
         Args:
-            action (Action): The action to be executed.
-            history (List[Dict[str, Any]]): The list of recent historical turns.
+            action: Action to process
+            agent_state: Current state of the agent
+            constitution: Agent's constitution for judge evaluation
             
         Returns:
-            Percept: An object containing the observation, the judge's evaluation (reward), and cost analysis.
+            Percept containing tool result and judge evaluation
         """
+        # Route action to subenvironment
+        tool_result = self._route_to_subenvironment(action)
         
-        # This is the qualitative cost description.
-        cost_analysis = self._analyze_action_profile(action)
+        # Format action description for judge
+        action_description = self._format_action_for_judge(action)
         
-        # Execute the action in the appropriate subenvironment
-        if action.tool not in self.subenvironments:
-            observation = f"Error: Unknown tool '{action.tool}'"
-        else:
-            try:
-                # Call the tool function (e.g., the searcher's .search method)
-                observation = self.subenvironments[action.tool](action.payload)
-            except Exception as e:
-                observation = f"Error executing tool '{action.tool}': {str(e)}"
-        
-        # FIX 2 of 2: The 'history' is now passed down to the judge.
-        reward_essay = self.judge.evaluate(
-            action=action, 
-            observation=observation, 
-            constitution=self.constitution,
-            history=history
+        # Get judge evaluation
+        judge_essay = self.judge.evaluate_action(
+            agent_state, constitution, action_description, tool_result
         )
         
-        # Return the complete percept, including the new cost analysis
-        return Percept(observation=observation, reward=reward_essay, cost_analysis=cost_analysis)
+        # Create and return percept
+        percept = Percept(
+            tool_result=tool_result,
+            judge_essay=judge_essay,
+            action_reference=action
+        )
+        
+        return percept
+    
+    def _route_to_subenvironment(self, action: Action) -> str:
+        """
+        Route an action to the appropriate subenvironment.
+        
+        Args:
+            action: Action to route
+            
+        Returns:
+            Result from the subenvironment
+        """
+        subenvironment_name = action.subenvironment
+        
+        # Check if subenvironment exists
+        if subenvironment_name not in self.subenvironments:
+            available = ", ".join(self.subenvironments.keys())
+            return f"ERROR: Unknown subenvironment '{subenvironment_name}'. Available: {available}"
+        
+        # Get the subenvironment function
+        subenvironment_info = self.subenvironments[subenvironment_name]
+        subenvironment_function = subenvironment_info["function"]
+        
+        try:
+            # Call the subenvironment function
+            result = subenvironment_function(action.input_body)
+            return result
+            
+        except Exception as e:
+            # Handle errors gracefully - they are treated as standard outputs in AIXI
+            return f"ERROR: Subenvironment '{subenvironment_name}' failed: {str(e)}"
+    
+    def _format_action_for_judge(self, action: Action) -> str:
+        """
+        Format an action for judge evaluation.
+        
+        Args:
+            action: Action to format
+            
+        Returns:
+            Formatted action description
+        """
+        formatted = [
+            f"Subenvironment: {action.subenvironment}",
+            f"Input Body: {action.input_body}",
+            f"Timestamp: {action.timestamp.isoformat()}"
+        ]
+        
+        if action.reasoning:
+            formatted.append(f"Agent's Reasoning: {action.reasoning}")
+        
+        return "\n".join(formatted)
+    
+    def validate_action(self, action: Action) -> tuple[bool, str]:
+        """
+        Validate an action before processing.
+        
+        Args:
+            action: Action to validate
+            
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        # Check if subenvironment exists
+        if action.subenvironment not in self.subenvironments:
+            available = ", ".join(self.subenvironments.keys())
+            return False, f"Unknown subenvironment '{action.subenvironment}'. Available: {available}"
+        
+        # Check if input_body is provided
+        if not action.input_body.strip():
+            return False, "Action input_body cannot be empty"
+        
+        # Additional validation could be added here
+        # For example, JSON schema validation for specific subenvironments
+        
+        return True, ""
+    
+    def get_subenvironment_docs(self) -> str:
+        """
+        Get documentation for all available subenvironments.
+        
+        Returns:
+            Combined documentation string
+        """
+        from subenvironments import get_all_docs
+        return get_all_docs()
+    
+    def test_subenvironment(self, subenvironment_name: str, test_input: str) -> str:
+        """
+        Test a subenvironment with given input (useful for debugging).
+        
+        Args:
+            subenvironment_name: Name of subenvironment to test
+            test_input: Test input to send
+            
+        Returns:
+            Test result
+        """
+        if subenvironment_name not in self.subenvironments:
+            available = ", ".join(self.subenvironments.keys())
+            return f"ERROR: Unknown subenvironment '{subenvironment_name}'. Available: {available}"
+        
+        try:
+            subenvironment_function = self.subenvironments[subenvironment_name]["function"]
+            result = subenvironment_function(test_input)
+            return f"TEST SUCCESS: {result}"
+        except Exception as e:
+            return f"TEST ERROR: {str(e)}"
+    
+    def get_orchestrator_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about the orchestrator.
+        
+        Returns:
+            Dictionary with orchestrator statistics
+        """
+        return {
+            "available_subenvironments": list(self.subenvironments.keys()),
+            "subenvironment_count": len(self.subenvironments),
+            "judge_model_info": self.judge.get_model_info()
+        }
